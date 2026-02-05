@@ -1,105 +1,99 @@
-name: Alpine x86_64 Auto Build (智能检测语言)
-on: [push, pull_request]  # 推代码/PR自动触发，可加tag触发：tags: ['*']
+name: Alpine x86_64 Auto Build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        type: boolean
+        default: false
+        description: '启用调试模式'
 jobs:
   auto-build:
     runs-on: ubuntu-latest
-    container: alpine:3.23  # 指定Alpine 3.23 x86_64
+    container: alpine:3.23
     steps:
       - name: 基础环境初始化
         run: |
-          apk update && apk add --no-cache git file coreutils  # 基础工具+文件检测工具
-          mkdir -p /app /build  # 产物目录/编译目录
+          apk update && apk add --no-cache git file coreutils
+          mkdir -p /app /build
 
       - name: 拉取源码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # 浅克隆加速编译
+          fetch-depth: 1
 
       - name: 智能检测源码类型
         id: detect-lang
         run: |
-          # 检测Go语言：存在go.mod即为Go项目
           if [ -f "go.mod" ]; then
             echo "lang=go" >> $GITHUB_OUTPUT
-            echo "检测到Go语言，启用Go静态编译逻辑"
-          # 检测CMake：存在CMakeLists.txt即为CMake项目
           elif [ -f "CMakeLists.txt" ]; then
             echo "lang=cmake" >> $GITHUB_OUTPUT
-            echo "检测到CMake项目，启用CMake编译逻辑"
-          # 检测configure：存在configure即为autotools项目
           elif [ -f "configure" ]; then
             echo "lang=configure" >> $GITHUB_OUTPUT
-            echo "检测到configure项目，启用autotools编译逻辑"
-          # 自动生成configure：存在configure.ac/autogen.sh，先执行生成
           elif [ -f "configure.ac" ] || [ -f "autogen.sh" ]; then
             echo "lang=autogen" >> $GITHUB_OUTPUT
-            echo "检测到autogen文件，生成configure后编译"
           else
-            echo "::error::未检测到支持的编译类型（Go/CMake/configure/autogen）"
+            echo "::error::未检测到支持的编译类型"
             exit 1
           fi
 
-      - name: 安装Go编译依赖 & 编译（Go专属）
+      - name: 安装Go编译依赖 & 编译
         if: steps.detect-lang.outputs.lang == 'go'
         run: |
-          # 安装Go环境
           apk add --no-cache go
-          # 静态编译Alpine x86_64可执行文件（禁用CGO，自动找入口）
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o /app/app-alpine-x86_64
-          # 验证编译结果
           chmod +x /app/app-alpine-x86_64
           file /app/app-alpine-x86_64
 
-      - name: 安装CMake编译依赖 & 编译（CMake专属）
+      - name: 安装CMake编译依赖 & 编译
         if: steps.detect-lang.outputs.lang == 'cmake'
         run: |
-          # 安装CMake编译工具链
           apk add --no-cache build-base musl-dev gcc g++ cmake make linux-headers
-          # 编译（out-of-source，避免污染源码）
           mkdir -p build && cd build
           cmake .. -DCMAKE_INSTALL_PREFIX=/app \
                    -DCMAKE_C_COMPILER=musl-gcc \
                    -DCMAKE_CXX_COMPILER=musl-g++ \
                    -DCMAKE_SYSTEM_PROCESSOR=x86_64
           make -j$(nproc) && make install
-          # 验证编译结果
           file $(find /app -type f -executable | head -1)
 
-      - name: 安装configure编译依赖 & 编译（autotools专属）
+      - name: 安装configure编译依赖 & 编译
         if: steps.detect-lang.outputs.lang == 'configure'
         run: |
-          # 安装autotools编译工具链
           apk add --no-cache build-base musl-dev gcc g++ make autoconf automake libtool pkgconfig linux-headers
-          # 编译（musl x86_64）
           ./configure --prefix=/app --build=x86_64-linux-musl
           make -j$(nproc) && make install
-          # 验证编译结果
           file $(find /app -type f -executable | head -1)
 
-      - name: 生成configure & 编译（autogen专属）
+      - name: 生成configure & 编译
         if: steps.detect-lang.outputs.lang == 'autogen'
         run: |
-          # 安装完整编译工具链
           apk add --no-cache build-base musl-dev gcc g++ make autoconf automake libtool pkgconfig linux-headers
-          # 生成configure脚本（优先执行autogen.sh，无则手动autoreconf）
           if [ -f "autogen.sh" ]; then
             chmod +x autogen.sh && ./autogen.sh
           else
             autoreconf -vfi
           fi
-          # 编译（musl x86_64）
           ./configure --prefix=/app --build=x86_64-linux-musl
           make -j$(nproc) && make install
-          # 验证编译结果
           file $(find /app -type f -executable | head -1)
+
+      - name: 调试步骤
+        if: github.event_name == 'workflow_dispatch' && inputs.debug_enabled == true
+        run: |
+          echo "调试模式已启用"
+          echo "检测到的语言类型: ${{ steps.detect-lang.outputs.lang }}"
+          echo "当前目录内容:"
+          ls -la
+          echo "App目录内容:"
+          find /app -type f -print
 
       - name: 产物瘦身 & 统一归档
         run: |
-          # 对可执行文件瘦身（strip），减小体积
           find /app -type f -executable -exec strip {} \; 2>/dev/null || true
-          # 打包所有产物为tar.gz，方便下载
           tar -zcvf /build/alpine-x86_64-build-$(date +%Y%m%d).tar.gz /app
-          # 输出产物信息
           echo "编译产物已打包：$(ls /build/*.tar.gz)"
           echo "产物内可执行文件：$(find /app -type f -executable | wc -l) 个"
 
@@ -108,4 +102,4 @@ jobs:
         with:
           name: alpine-x86_64-compile-result
           path: /build/*.tar.gz
-          retention-days: 7  # 产物保留7天，可修改为90
+          retention-days: 7
