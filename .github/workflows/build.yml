@@ -34,41 +34,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          
-          # 验证安装
-          x86_64-linux-musl-gcc --version || echo "musl工具已安装"
 
       - name: Configure Build Environment
         run: |
-          # 设置构建类型
           if [ '${{ github.event.inputs.build_type }}' = 'lite' ]; then
-            export BUILD_TAGS="lite"
-            export BUILD_TYPE="lite"
+            echo "BUILD_TAGS=lite" >> $GITHUB_ENV
+            echo "BUILD_TYPE=lite" >> $GITHUB_ENV
           else
-            export BUILD_TAGS=""
-            export BUILD_TYPE="standard"
+            echo "BUILD_TAGS=" >> $GITHUB_ENV
+            echo "BUILD_TYPE=standard" >> $GITHUB_ENV
           fi
-          
-          echo "BUILD_TAGS=$BUILD_TAGS" >> $GITHUB_ENV
-          echo "BUILD_TYPE=$BUILD_TYPE" >> $GITHUB_ENV
-          
-          echo "Building $BUILD_TYPE version"
-          echo "Build tags: $BUILD_TAGS"
 
       - name: Download Go Dependencies
         run: |
           go mod download
-          echo "Dependencies downloaded"
 
       - name: Build for Alpine (static musl)
         run: |
-          echo "开始静态编译Alpine版本..."
+          echo "编译Alpine静态二进制文件..."
           
-          # 设置musl编译器
-          export CC=x86_64-linux-musl-gcc
-          export CXX=x86_64-linux-musl-g++
-          
-          # 静态编译
+          # 编译Alpine可执行文件（静态musl）
           CGO_ENABLED=1 \
           GOOS=linux \
           GOARCH=amd64 \
@@ -79,103 +64,143 @@ jobs:
             -ldflags="-s -w -extldflags '-static'" \
             -buildvcs=false \
             -tags="$BUILD_TAGS" \
-            -o openlist-alpine .
+            -o openlist-alpine-x86_64 .
           
           if [ $? -eq 0 ]; then
             echo "编译成功!"
-            chmod +x openlist-alpine
+            chmod +x openlist-alpine-x86_64
             
-            # 验证文件
-            echo "文件信息:"
-            file openlist-alpine
-            echo "文件大小:"
-            ls -lh openlist-alpine
-            
-            # 检查是否为静态链接
-            echo "链接检查:"
-            ldd openlist-alpine 2>&1 | grep -q "not a dynamic" && echo "✓ 静态链接" || echo "⚠ 可能是动态链接"
+            # 验证
+            echo "=== 文件验证 ==="
+            echo "文件类型:"
+            file openlist-alpine-x86_64
+            echo -e "\n链接检查:"
+            ldd openlist-alpine-x86_64 2>&1 || echo "✓ 静态链接（musl）"
+            echo -e "\nELF信息:"
+            readelf -h openlist-alpine-x86_64 | grep -E "(Class|Machine|Type)"
           else
             echo "::error::编译失败"
             exit 1
           fi
 
-      - name: Install UPX for compression
+      - name: Create Direct Alpine Binary Package
         run: |
-          sudo apt-get install -y upx
-          upx --version
-
-      - name: Compress Binary
-        run: |
-          if [ -f "openlist-alpine" ]; then
-            echo "使用UPX压缩二进制文件..."
-            
-            # 备份原始文件
-            cp openlist-alpine openlist-alpine-original
-            
-            # 压缩
-            upx --best --lzma -q openlist-alpine -o openlist-alpine-compressed
-            mv openlist-alpine-compressed openlist-alpine
-            
-            echo "压缩完成:"
-            ORIGINAL_SIZE=$(stat -c%s "openlist-alpine-original")
-            COMPRESSED_SIZE=$(stat -c%s "openlist-alpine")
-            echo "原始大小: $ORIGINAL_SIZE bytes"
-            echo "压缩后: $COMPRESSED_SIZE bytes"
-            echo "压缩率: $((100 - COMPRESSED_SIZE * 100 / ORIGINAL_SIZE))%"
-            
-            # 验证压缩后的文件
-            echo "压缩后文件信息:"
-            file openlist-alpine
-          else
-            echo "::error::未找到编译产物"
-            exit 1
+          echo "创建Alpine专用包..."
+          
+          # 创建Alpine专用目录
+          mkdir -p alpine-package
+          
+          # 复制二进制文件
+          cp openlist-alpine-x86_64 alpine-package/openlist
+          
+          # 创建Alpine安装脚本
+          cat > alpine-package/install-alpine.sh << 'EOF'
+          #!/bin/sh
+          # OpenList Alpine安装脚本
+          
+          echo "正在安装OpenList到Alpine系统..."
+          
+          # 检查系统
+          if ! grep -q "Alpine" /etc/os-release 2>/dev/null; then
+              echo "警告：这似乎不是Alpine系统"
+              echo "此二进制文件专为Alpine Linux优化"
           fi
+          
+          # 安装到系统路径
+          INSTALL_PATH="/usr/local/bin"
+          
+          if [ "$(id -u)" -eq 0 ]; then
+              cp openlist "$INSTALL_PATH/openlist"
+              chmod 755 "$INSTALL_PATH/openlist"
+              echo "✓ 已安装到 $INSTALL_PATH/openlist"
+              
+              # 创建符号链接
+              ln -sf "$INSTALL_PATH/openlist" "$INSTALL_PATH/ol" 2>/dev/null || true
+              
+              echo "安装完成！"
+              echo "使用方法: openlist 或 ol"
+          else
+              echo "需要root权限安装到系统目录"
+              echo "请使用: sudo sh install-alpine.sh"
+              exit 1
+          fi
+          EOF
+          
+          chmod +x alpine-package/install-alpine.sh
+          
+          # 创建Alpine兼容的tar包
+          cd alpine-package
+          tar -czf ../openlist-alpine-bin.tar.gz *
+          cd ..
+          
+          # 创建更简单的包（仅二进制）
+          tar -czf openlist-alpine-binary-only.tar.gz openlist-alpine-x86_64
+          
+          echo "生成的文件:"
+          ls -lh openlist-alpine-*.tar.gz
 
       - name: Create Distribution Package
         run: |
-          echo "创建分发包..."
+          echo "创建完整分发包..."
           
-          # 创建目录结构
-          mkdir -p dist/alpine
+          # 创建标准分发目录
+          mkdir -p dist/alpine-x86_64
           
-          # 复制二进制文件
-          cp openlist-alpine dist/alpine/
+          # 复制所有文件
+          cp openlist-alpine-x86_64 dist/alpine-x86_64/
+          cp alpine-package/install-alpine.sh dist/alpine-x86_64/ 2>/dev/null || true
           
-          # 创建README
-          cat > dist/alpine/README.md << 'EOF'
-          # OpenList Alpine Build
-          
-          ## 版本信息
-          - 构建类型: ${{ env.BUILD_TYPE }}
-          - 构建时间: $(date)
-          - 架构: x86_64 (amd64)
-          - 环境: Alpine Linux compatible (static musl)
-          
-          ## 使用说明
-          1. 直接运行: `chmod +x openlist-alpine && ./openlist-alpine`
-          2. 或复制到Alpine系统: `cp openlist-alpine /usr/local/bin/openlist`
-          
-          ## 注意事项
-          - 此版本为静态编译，不依赖系统库
-          - 可在Alpine Linux及其他使用musl libc的系统上运行
+          # 创建版本信息
+          cat > dist/alpine-x86_64/VERSION << EOF
+          OpenList Alpine Build
+          Version: ${{ github.sha }}
+          Build Type: ${{ env.BUILD_TYPE }}
+          Build Date: $(date)
+          Platform: Alpine Linux x86_64 (musl)
+          Architecture: amd64
+          Static: yes
+          Compressed: no
           EOF
           
-          # 创建tar.gz包
-          cd dist/alpine
-          tar -czf ../openlist-alpine-${{ env.BUILD_TYPE }}.tar.gz .
+          # 打包
+          cd dist/alpine-x86_64
+          tar -czf ../openlist-alpine-x86_64-${{ env.BUILD_TYPE }}.tar.gz .
           
-          # 生成SHA256校验和
+          # 生成校验和
           cd ..
-          sha256sum openlist-alpine-${{ env.BUILD_TYPE }}.tar.gz > openlist-alpine-${{ env.BUILD_TYPE }}.tar.gz.sha256
+          sha256sum openlist-alpine-x86_64-${{ env.BUILD_TYPE }}.tar.gz > openlist-alpine-x86_64-${{ env.BUILD_TYPE }}.tar.gz.sha256
           
-          echo "包创建完成:"
-          ls -lh openlist-alpine-*.tar.gz*
+          echo "分发包内容:"
+          tar -tzf openlist-alpine-x86_64-${{ env.BUILD_TYPE }}.tar.gz
 
-      - name: Upload Artifacts
+      - name: Compress with UPX (可选)
+        run: |
+          echo "使用UPX压缩..."
+          sudo apt-get install -y upx || true
+          
+          if command -v upx &> /dev/null; then
+            # 压缩主二进制文件
+            upx --best --lzma -q openlist-alpine-x86_64 -o openlist-alpine-x86_64-upx
+            
+            # 创建压缩版包
+            mkdir -p dist/compressed
+            cp openlist-alpine-x86_64-upx dist/compressed/openlist
+            tar -czf dist/openlist-alpine-x86_64-${{ env.BUILD_TYPE }}-upx.tar.gz -C dist/compressed .
+            
+            sha256sum dist/openlist-alpine-x86_64-${{ env.BUILD_TYPE }}-upx.tar.gz > dist/openlist-alpine-x86_64-${{ env.BUILD_TYPE }}-upx.tar.gz.sha256
+            
+            echo "压缩前后对比:"
+            ls -lh openlist-alpine-x86_64*
+          else
+            echo "UPX不可用，跳过压缩"
+          fi
+
+      - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openlist-alpine-${{ env.BUILD_TYPE }}
+          name: openlist-alpine-${{ env.BUILD_TYPE }}-x86_64
           path: |
-            dist/openlist-alpine-*.tar.gz
-            dist/openlist-alpine-*.tar.gz.sha256
+            openlist-alpine-x86_64
+            openlist-alpine-*.tar.gz
+            dist/openlist-alpine-*.tar.gz*
           retention-days: 30
