@@ -5,8 +5,6 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  release:
-    types: [ published ]
   workflow_dispatch:
     inputs:
       build_type:
@@ -18,187 +16,84 @@ on:
         - standard
         - lite
 
-permissions:
-  contents: write
-
 jobs:
   alpine-build:
     name: Alpine ${{ github.event.inputs.build_type || 'standard' }}
     runs-on: ubuntu-latest
-    container:
-      image: alpine:3.23
     
     steps:
-      - name: Setup Alpine Environment
-        run: |
-          apk update
-          apk add --no-cache \
-            git \
-            bash \
-            coreutils \
-            file \
-            ca-certificates \
-            make \
-            upx
-          
-          # 创建工作目录
-          mkdir -p /workspace
-          cd /workspace
-
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          path: /workspace/src
 
       - name: Setup Go
-        run: |
-          apk add --no-cache go gcc g++ musl-dev linux-headers
-          go version
-          
-          # 设置Go环境
-          go env -w GOPROXY=https://proxy.golang.org,direct
-          go env -w GOSUMDB=on
-          go env -w GO111MODULE=on
-          
-          echo "Go setup completed"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
 
-      - name: Configure Git
+      - name: Install Alpine Build Tools
         run: |
-          cd /workspace/src
-          git config --global --add safe.directory /workspace/src
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-
-      - name: Detect Build Configuration
-        id: config
-        run: |
-          cd /workspace/src
+          # 下载Alpine的静态编译工具链
+          wget http://dl-cdn.alpinelinux.org/alpine/v3.23/main/x86_64/apk-tools-static-2.14.0-r2.apk
+          tar -xzf apk-tools-static-2.14.0-r2.apk
           
-          # 检查是否为lite版本
-          IS_LITE="false"
-          if [[ "${{ github.event.inputs.build_type }}" == "lite" ]] || [[ "${{ matrix.build-type }}" == "lite" ]]; then
-            IS_LITE="true"
-          fi
+          # 创建Alpine构建环境
+          mkdir -p alpine-build
+          cd alpine-build
+
+      - name: Cross-compile for Alpine (static musl)
+        run: |
+          # 设置交叉编译环境
+          export CC=x86_64-linux-musl-gcc
+          export CXX=x86_64-linux-musl-g++
           
           # 构建标志
-          BUILD_FLAGS="-trimpath -ldflags='-s -w -extldflags \"-static\"' -buildvcs=false"
-          if [ "$IS_LITE" = "true" ]; then
-            BUILD_FLAGS="$BUILD_FLAGS -tags=lite"
+          if [ '${{ github.event.inputs.build_type }}' = 'lite' ]; then
+            BUILD_TAGS='-tags=lite'
+            BUILD_TYPE='lite'
+          else
+            BUILD_TAGS=''
+            BUILD_TYPE='standard'
           fi
           
-          echo "is_lite=$IS_LITE" >> $GITHUB_OUTPUT
-          echo "build_flags=$BUILD_FLAGS" >> $GITHUB_OUTPUT
+          # 静态编译
+          CGO_ENABLED=1 \
+          GOOS=linux \
+          GOARCH=amd64 \
+          CC=x86_64-linux-musl-gcc \
+          CXX=x86_64-linux-musl-g++ \
+          go build $BUILD_TAGS \
+            -trimpath \
+            -ldflags="-s -w -extldflags '-static'" \
+            -buildvcs=false \
+            -o openlist-alpine .
           
-          echo "Build Configuration:"
-          echo "  Type: ${{ github.event.inputs.build_type || 'standard' }}"
-          echo "  Lite: $IS_LITE"
-          echo "  Flags: $BUILD_FLAGS"
+          chmod +x openlist-alpine
+          
+          # 验证
+          file openlist-alpine
+          ls -lh openlist-alpine
 
-      - name: Prepare Dependencies
+      - name: Compress and Package
         run: |
-          cd /workspace/src
-          echo "Preparing dependencies..."
-          
-          # 下载依赖
-          echo "Downloading modules..."
-          go mod download 2>&1 | tail -20 || {
-            echo "go mod download failed, trying go mod tidy..."
-            go mod tidy 2>&1 | tail -20 || true
-          }
-          
-          # 显示依赖信息
-          echo "Module information:"
-          go list -m all | head -5
-
-      - name: Build Binary
-        run: |
-          cd /workspace/src
-          
-          BUILD_FLAGS="${{ steps.config.outputs.build_flags }}"
-          IS_LITE="${{ steps.config.outputs.is_lite }}"
-          
-          echo "Building with flags: $BUILD_FLAGS"
-          
-          # 创建输出目录
-          mkdir -p /workspace/build/compress
-          
-          # 查找主包
-          MAIN_PKG="."
-          if [ -d "./cmd" ]; then
-            # 查找cmd目录下的包
-            for cmd in ./cmd/*/; do
-              if [ -d "$cmd" ] && [ -f "${cmd}main.go" ]; then
-                MAIN_PKG="./${cmd%/}"
-                echo "Found main package: $MAIN_PKG"
-                break
-              fi
-            done
-          fi
-          
-          # 构建二进制
-          echo "Building from package: $MAIN_PKG"
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-          eval "go build $BUILD_FLAGS -o /workspace/build/openlist-alpine $MAIN_PKG"
-          
-          if [ $? -ne 0 ]; then
-            echo "::error::Build failed"
-            exit 1
-          fi
-          
-          chmod +x /workspace/build/openlist-alpine
-          
-          # 文件信息
-          echo "Build completed:"
-          file /workspace/build/openlist-alpine
-          ls -lh /workspace/build/openlist-alpine
-
-      - name: Compress Binary
-        run: |
-          cd /workspace/build
-          IS_LITE="${{ steps.config.outputs.is_lite }}"
-          BUILD_TYPE="${{ github.event.inputs.build_type || 'standard' }}"
+          cd alpine-build
+          BUILD_TYPE='${{ github.event.inputs.build_type || 'standard' }}'
           
           # 使用UPX压缩
           if command -v upx &> /dev/null; then
-            echo "Compressing binary with UPX..."
-            upx --best --lzma -q /workspace/build/openlist-alpine -o /workspace/build/compress/openlist-alpine-upx
-            mv /workspace/build/compress/openlist-alpine-upx /workspace/build/compress/openlist-alpine
-            
-            echo "Compression results:"
-            ORIGINAL_SIZE=$(stat -c%s "/workspace/build/openlist-alpine")
-            COMPRESSED_SIZE=$(stat -c%s "/workspace/build/compress/openlist-alpine")
-            echo "Original: $ORIGINAL_SIZE bytes"
-            echo "Compressed: $COMPRESSED_SIZE bytes"
-            echo "Reduction: $((100 - COMPRESSED_SIZE * 100 / ORIGINAL_SIZE))%"
-          else
-            echo "UPX not available, copying binary..."
-            cp /workspace/build/openlist-alpine /workspace/build/compress/
+            upx --best --lzma -q openlist-alpine -o openlist-alpine-compressed
+            mv openlist-alpine-compressed openlist-alpine
           fi
           
-          # 创建tar.gz包
-          cd /workspace/build/compress
+          # 打包
           tar -czf openlist-alpine-$BUILD_TYPE.tar.gz openlist-alpine
-          
-          # 生成校验和
           sha256sum openlist-alpine-$BUILD_TYPE.tar.gz > openlist-alpine-$BUILD_TYPE.tar.gz.sha256
           
           echo "Artifacts created:"
-          ls -lh /workspace/build/compress/
+          ls -lh *.tar.gz *.sha256
 
-      - name: Upload Artifacts (Push/PR)
-        if: github.event_name != 'release'
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: openlist-alpine-${{ github.event.inputs.build_type || 'standard' }}
-          path: /workspace/build/compress/*
+          path: alpine-build/openlist-alpine-*.tar.gz*
           retention-days: 30
-
-      - name: Upload Release Assets
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: /workspace/build/compress/*
-          tag_name: ${{ github.event.release.tag_name }}
-          draft: false
-          prerelease: false
