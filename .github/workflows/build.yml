@@ -1,4 +1,4 @@
-name: Alpine x86_64 Auto Build
+name: OpenList Alpine x86_64 编译
 on:
   push:
   pull_request:
@@ -9,11 +9,11 @@ on:
         default: false
         description: '启用调试模式'
 jobs:
-  auto-build:
+  compile-openlist:
     runs-on: ubuntu-latest
     container: alpine:3.23
     steps:
-      - name: 基础环境初始化
+      - name: 初始化环境
         run: |
           apk update && apk add --no-cache git file coreutils
           mkdir -p /app /build
@@ -21,85 +21,83 @@ jobs:
       - name: 拉取源码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0  # 改为完整克隆，解决VCS问题
 
-      - name: 智能检测源码类型
-        id: detect-lang
+      - name: 安装Go编译环境
         run: |
-          if [ -f "go.mod" ]; then
-            echo "lang=go" >> $GITHUB_OUTPUT
-          elif [ -f "CMakeLists.txt" ]; then
-            echo "lang=cmake" >> $GITHUB_OUTPUT
-          elif [ -f "configure" ]; then
-            echo "lang=configure" >> $GITHUB_OUTPUT
-          elif [ -f "configure.ac" ] || [ -f "autogen.sh" ]; then
-            echo "lang=autogen" >> $GITHUB_OUTPUT
+          apk add --no-cache go gcc g++ musl-dev linux-headers
+          go version
+          go env
+
+      - name: 编译OpenList
+        run: |
+          cd /__w/openlist/openlist  # GitHub Actions的标准工作目录
+          
+          # 设置Go模块代理（加速下载）
+          go env -w GOPROXY=https://goproxy.cn,direct
+          go env -w GOSUMDB=off
+          
+          # 下载依赖并编译（禁用VCS检查，使用静态编译）
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+          go build -trimpath -ldflags="-s -w -extldflags '-static' -buildvcs=false" \
+          -o /app/openlist-alpine-x86_64 ./cmd/openlist
+          
+          # 验证编译结果
+          chmod +x /app/openlist-alpine-x86_64
+          file /app/openlist-alpine-x86_64
+          ldd /app/openlist-alpine-x86_64 2>/dev/null || echo "静态编译，无动态依赖"
+
+      - name: 备用编译方式（如果主入口不对）
+        if: failure()
+        run: |
+          cd /__w/openlist/openlist
+          
+          # 查找Go项目的主入口
+          echo "查找Go项目入口点..."
+          find . -name "*.go" -type f | head -20
+          
+          # 尝试不同的入口点
+          if [ -f "./main.go" ]; then
+            echo "找到main.go，尝试编译..."
+            CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -extldflags '-static' -buildvcs=false" \
+            -o /app/openlist-alpine-x86_64 .
+          elif [ -d "./cmd" ]; then
+            echo "找到cmd目录，列出可编译目标..."
+            for cmd in ./cmd/*; do
+              if [ -d "$cmd" ]; then
+                echo "尝试编译: $cmd"
+                CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+                go build -trimpath -ldflags="-s -w -extldflags '-static' -buildvcs=false" \
+                -o /app/openlist-alpine-x86_64 "$cmd"
+                break
+              fi
+            done
+          fi
+          
+          if [ -f "/app/openlist-alpine-x86_64" ]; then
+            chmod +x /app/openlist-alpine-x86_64
+            file /app/openlist-alpine-x86_64
+          fi
+
+      - name: 产物处理
+        run: |
+          # 如果编译成功，处理产物
+          if [ -f "/app/openlist-alpine-x86_64" ]; then
+            strip /app/openlist-alpine-x86_64 2>/dev/null || true
+            tar -zcvf /build/openlist-alpine-x86_64-$(date +%Y%m%d-%H%M%S).tar.gz -C /app .
+            echo "编译成功！"
+            echo "文件信息:"
+            file /app/openlist-alpine-x86_64
+            echo "文件大小: $(du -h /app/openlist-alpine-x86_64 | cut -f1)"
           else
-            echo "::error::未检测到支持的编译类型"
+            echo "::error::编译失败，未生成可执行文件"
             exit 1
           fi
 
-      - name: 安装Go编译依赖 & 编译
-        if: steps.detect-lang.outputs.lang == 'go'
-        run: |
-          apk add --no-cache go
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o /app/app-alpine-x86_64
-          chmod +x /app/app-alpine-x86_64
-          file /app/app-alpine-x86_64
-
-      - name: 安装CMake编译依赖 & 编译
-        if: steps.detect-lang.outputs.lang == 'cmake'
-        run: |
-          apk add --no-cache build-base musl-dev gcc g++ cmake make linux-headers
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_INSTALL_PREFIX=/app \
-                   -DCMAKE_C_COMPILER=musl-gcc \
-                   -DCMAKE_CXX_COMPILER=musl-g++ \
-                   -DCMAKE_SYSTEM_PROCESSOR=x86_64
-          make -j$(nproc) && make install
-          file $(find /app -type f -executable | head -1)
-
-      - name: 安装configure编译依赖 & 编译
-        if: steps.detect-lang.outputs.lang == 'configure'
-        run: |
-          apk add --no-cache build-base musl-dev gcc g++ make autoconf automake libtool pkgconfig linux-headers
-          ./configure --prefix=/app --build=x86_64-linux-musl
-          make -j$(nproc) && make install
-          file $(find /app -type f -executable | head -1)
-
-      - name: 生成configure & 编译
-        if: steps.detect-lang.outputs.lang == 'autogen'
-        run: |
-          apk add --no-cache build-base musl-dev gcc g++ make autoconf automake libtool pkgconfig linux-headers
-          if [ -f "autogen.sh" ]; then
-            chmod +x autogen.sh && ./autogen.sh
-          else
-            autoreconf -vfi
-          fi
-          ./configure --prefix=/app --build=x86_64-linux-musl
-          make -j$(nproc) && make install
-          file $(find /app -type f -executable | head -1)
-
-      - name: 调试步骤
-        if: github.event_name == 'workflow_dispatch' && inputs.debug_enabled == true
-        run: |
-          echo "调试模式已启用"
-          echo "检测到的语言类型: ${{ steps.detect-lang.outputs.lang }}"
-          echo "当前目录内容:"
-          ls -la
-          echo "App目录内容:"
-          find /app -type f -print
-
-      - name: 产物瘦身 & 统一归档
-        run: |
-          find /app -type f -executable -exec strip {} \; 2>/dev/null || true
-          tar -zcvf /build/alpine-x86_64-build-$(date +%Y%m%d).tar.gz /app
-          echo "编译产物已打包：$(ls /build/*.tar.gz)"
-          echo "产物内可执行文件：$(find /app -type f -executable | wc -l) 个"
-
-      - name: 上传产物到GitHub Artifact
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: alpine-x86_64-compile-result
+          name: openlist-alpine-x86_64
           path: /build/*.tar.gz
           retention-days: 7
